@@ -1,5 +1,18 @@
 # Changelog
 
+## 5.2.1
+
+- Added stability-first two-video batch pipelines with conservative local-model parallelism.
+- Added per-video batch checkpoints, resume-after-restart, and explicit retry for failed items.
+- Added streaming Ollama progress, dynamic context sizing, and one automatic retry for interrupted model responses.
+- Added a batch activity lease so portable updates cannot stage or apply during an active batch.
+- Added paged Native Messaging delivery for very large Whisper transcripts.
+- Removed duplicate full-transcript copies from stored batch records and added transcript-cache pruning while preserving summaries.
+- Limited long-video Q&A to relevant transcript excerpts instead of sending the entire transcript blindly.
+- Tightened list-page video discovery to reduce accidental inclusion of recommendation links.
+- Prevented two tabs from starting competing batches in the same native-host session.
+- Added local storage backup/import for future upgrades and legacy-development-version migration.
+
 ## 5.2.0
 
 - Replaced the custom BiliSum localhost service with Chrome Native Messaging.

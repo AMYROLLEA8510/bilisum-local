@@ -112,6 +112,9 @@
     batchRunning: false,
     stopRequested: false,
     lastBatch: null,
+    activeBatch: null,
+    batchLeaseId: '',
+    batchHeartbeat: null,
     autoTimer: null
   };
 
@@ -119,6 +122,8 @@
   const oldVideoKey = (bvid) => `bilisum:video:${bvid}`;
   const channelKey = (mid) => `bilisum:v5:channel:${mid}:index`;
   const batchKey = (mid) => `bilisum:v5:batch:${mid || 'list'}`;
+  const activeBatchKey = (scope) => `bilisum:v5:batch-active:${scope || 'list'}`;
+  const batchScope = () => state.mid ? `mid:${state.mid}` : state.isList ? `list:${location.pathname}` : 'list';
 
   function getBvid() {
     const fromPath = location.pathname.match(/\/video\/(BV[0-9A-Za-z]+)/i)?.[1];
@@ -276,6 +281,12 @@
       const qText = q > 1 ? ` · 队列 ${q}` : '';
       return `${map[job?.stage] || '排队中'}${qText}${ageText}${worker}`;
     }
+    if (job?.stage === 'generating') {
+      const elapsed = Number(job?.elapsed_sec || 0);
+      const chars = Number(job?.generated_chars || 0);
+      const detail = job?.detail && !['Queued', ''].includes(job.detail) ? job.detail : '';
+      return `${map.generating}${chars ? ` · 已生成 ${chars} 字` : ''}${elapsed >= 1 ? ` · ${elapsed.toFixed(0)}s` : ''}${detail && !/Generated \d+ chars/.test(detail) ? ` · ${detail}` : ''}`;
+    }
     return `${map[job?.stage] || job?.detail || '处理中'}${pct > 0 && pct < 100 ? ` ${Math.round(pct)}%` : ''}${job?.detail && !['Queued',''].includes(job.detail) && job?.stage !== 'done' ? ` · ${job.detail}` : ''}`;
   }
 
@@ -288,7 +299,22 @@
       if (!r?.ok) throw new Error(r?.error || '本地任务状态读取失败');
       const job = r.data || {};
       onProgress(jobStageText(job, kind), job);
-      if (job.status === 'done') return job.result || {};
+      if (job.status === 'done') {
+        const result = job.result || {};
+        if (kind === 'asr' && result.paged) {
+          const segments = []; let offset = 0;
+          while (true) {
+            const page = await send({ type: 'local:jobResultPage', jobId, offset, limit: 400 });
+            if (!page?.ok) throw new Error(page?.error || '听写结果分页读取失败');
+            segments.push(...(page.data?.segments || []));
+            if (page.data?.done) break;
+            offset = Number(page.data?.next_offset || segments.length);
+            onProgress(`读取长听写结果 ${segments.length}/${Number(result.segment_count || '?')}`);
+          }
+          return { ...result, paged: false, segments };
+        }
+        return result;
+      }
       if (job.status === 'error') throw new Error(job.error || job.detail || '本地任务失败');
     }
     throw new Error('本地任务等待超时。');
@@ -403,6 +429,22 @@
     };
   }
 
+  async function pruneOldTranscriptCopies(maxBytes = 350 * 1024 * 1024) {
+    try {
+      let used = await chrome.storage.local.getBytesInUse(null);
+      if (used <= maxBytes) return;
+      const all = await chrome.storage.local.get(null);
+      const entries = Object.entries(all)
+        .filter(([key, value]) => key.startsWith('bilisum:v5:video:') && value?.summary && value?.transcript)
+        .sort((a, b) => new Date(a[1]?.summary?.summarized_at || 0).getTime() - new Date(b[1]?.summary?.summarized_at || 0).getTime());
+      for (let i = 0; i < entries.length && used > maxBytes * 0.8; i++) {
+        const [key, value] = entries[i];
+        await storeSet({ [key]: { summary: value.summary } });
+        if (i % 8 === 7 || i === entries.length - 1) used = await chrome.storage.local.getBytesInUse(null);
+      }
+    } catch {}
+  }
+
   async function processVideo(video, onProgress = () => {}) {
     const bvid = video.bvid;
     const existing = (await storeGet(videoKey(bvid)))[videoKey(bvid)];
@@ -420,6 +462,7 @@
     const summary = await summarizeTranscript(transcript, onProgress);
     const cached = { summary, transcript };
     await storeSet({ [videoKey(bvid)]: cached });
+    pruneOldTranscriptCopies();
     return cached;
   }
 
@@ -525,7 +568,11 @@
     const status = await backendStatusHtml(); const saveStatus = await saveStatusHtml();
     const cached = (await storeGet(videoKey(state.bvid)))[videoKey(state.bvid)];
     state.currentSummary = cached || null;
-    if (state.isList && !state.lastBatch) state.lastBatch = (await storeGet(batchKey(state.mid)))[batchKey(state.mid)] || null;
+    if (state.isList) {
+      const savedBatch = await storeGet([batchKey(state.mid), activeBatchKey(batchScope())]);
+      if (!state.lastBatch) state.lastBatch = savedBatch[batchKey(state.mid)] || null;
+      state.activeBatch = savedBatch[activeBatchKey(batchScope())] || null;
+    }
     const listItems = state.isList ? extractListVideos() : [];
     setMain(`${status}${saveStatus}
       <section class="bilisum-section">
@@ -536,8 +583,8 @@
       </section>
       <div id="bilisum-result">${cached ? renderSummary(cached) : (state.runningBvids.has(state.bvid) ? statusBox(state.currentProgress || '正在整理…') : '')}</div>
       ${state.isList ? `<section class="bilisum-section"><div class="bilisum-title-row"><h2>当前合集批量</h2><span class="bilisum-id">检测到 ${listItems.length} 条</span></div>
-        <div class="bilisum-actions"><button id="bilisum-list-batch" ${state.batchRunning ? 'disabled' : ''}>整理当前合集</button><button id="bilisum-list-stop" ${state.batchRunning ? '' : 'disabled'}>暂停</button>${state.lastBatch ? '<button id="bilisum-copy-batch">复制本批次</button><button id="bilisum-save-batch">保存本批次 TXT</button>' : ''}</div>
-        <p class="hint">当前合集能从页面识别到的课程会作为同一个批次，最终合并为一个 TXT。</p><div id="bilisum-batch-progress"></div></section>` : ''}
+        <div class="bilisum-actions"><button id="bilisum-list-batch" ${state.batchRunning ? 'disabled' : ''}>整理当前合集</button><button id="bilisum-list-stop" ${state.batchRunning ? '' : 'disabled'}>暂停</button>${state.activeBatch?.items?.length ? '<button id="bilisum-resume-batch">继续未完成批次</button>' : ''}${state.lastBatch?.failures?.length ? '<button id="bilisum-retry-failed">重试失败</button>' : ''}${state.lastBatch ? '<button id="bilisum-copy-batch">复制本批次</button><button id="bilisum-save-batch">保存本批次 TXT</button>' : ''}</div>
+        <p class="hint">当前合集能从页面识别到的课程会作为同一个批次。批次会逐条保存进度；浏览器重启后可继续。</p><div id="bilisum-batch-progress">${state.activeBatch?.items?.length ? statusBox(`发现未完成批次：${state.activeBatch.items.filter((x) => x.status === 'done').length}/${state.activeBatch.total || state.activeBatch.items.length} 已完成`, 'warn') : ''}</div></section>` : ''}
       <section class="bilisum-section"><h2>问这一课</h2><div class="bilisum-ask-row"><input id="bilisum-question" placeholder="例如：老师为什么这样分类？"><button id="bilisum-ask">问</button></div><div id="bilisum-answer"></div></section>`);
     qs('#bilisum-summarize').onclick = () => summarizeCurrentVideo(true);
     if (qs('#bilisum-copy-note')) qs('#bilisum-copy-note').onclick = async () => { await copyText(summaryToTxt(state.currentSummary)); flashButton('#bilisum-copy-note', '已复制'); };
@@ -546,6 +593,8 @@
     qs('#bilisum-ask').onclick = askCurrentVideo;
     if (qs('#bilisum-list-batch')) qs('#bilisum-list-batch').onclick = () => runBatch(listItems, `合集_${state.mid || state.bvid}`);
     if (qs('#bilisum-list-stop')) qs('#bilisum-list-stop').onclick = () => { state.stopRequested = true; };
+    if (qs('#bilisum-resume-batch')) qs('#bilisum-resume-batch').onclick = () => resumeActiveBatch();
+    if (qs('#bilisum-retry-failed')) qs('#bilisum-retry-failed').onclick = () => retryFailedBatch();
     if (qs('#bilisum-copy-batch')) qs('#bilisum-copy-batch').onclick = () => copyLastBatch();
     if (qs('#bilisum-save-batch')) qs('#bilisum-save-batch').onclick = () => saveLastBatch();
     wireTimeLinks();
@@ -596,13 +645,50 @@
 
   function wireTimeLinks() { qsa('#bilisum-local-root [data-t]').forEach((e) => { e.onclick = () => jumpTo(Number(e.dataset.part || 1), Number(e.dataset.t || 0)); }); }
 
+  function questionTerms(question) {
+    const q = String(question || '').toLowerCase();
+    const terms = new Set((q.match(/[a-z0-9_]{2,}/g) || []).filter((x) => x.length >= 2));
+    const cjk = (q.match(/[\u3400-\u9fff]/g) || []).join('');
+    for (let i = 0; i + 1 < cjk.length; i++) terms.add(cjk.slice(i, i + 2));
+    return [...terms].slice(0, 32);
+  }
+
+  function transcriptForQuestion(transcript, question, maxChars = 24000) {
+    const text = transcriptToText(transcript);
+    if (text.length <= maxChars) return text;
+    const chunks = splitText(text, 5200);
+    const terms = questionTerms(question);
+    const scored = chunks.map((chunk, index) => {
+      const lower = chunk.toLowerCase();
+      let score = index === 0 ? 0.2 : 0;
+      terms.forEach((term) => { let pos = 0; while ((pos = lower.indexOf(term, pos)) >= 0) { score += 1; pos += Math.max(1, term.length); } });
+      return { chunk, index, score };
+    }).sort((a, b) => b.score - a.score || a.index - b.index);
+    const chosen = []; let used = 0;
+    for (const item of scored) {
+      if (chosen.length >= 5 || used + item.chunk.length > maxChars) continue;
+      chosen.push(item); used += item.chunk.length;
+    }
+    return chosen.sort((a, b) => a.index - b.index).map((x) => x.chunk).join('\n');
+  }
+
+  async function ensureTranscriptForQuestion(cached) {
+    if (cached?.transcript?.parts?.some((p) => p.lines?.length)) return cached.transcript;
+    const tr = await send({ type: 'bili:transcript', bvid: state.bvid });
+    if (!tr?.ok) throw new Error(tr?.error || '字幕读取失败');
+    return completeTranscriptWithAsr(tr.data, () => {});
+  }
+
   async function askCurrentVideo() {
     const q = qs('#bilisum-question')?.value.trim(); if (!q) return;
     const box = qs('#bilisum-answer'); box.innerHTML = statusBox('正在依据字幕回答…');
     try {
       const cached = state.currentSummary || (await storeGet(videoKey(state.bvid)))[videoKey(state.bvid)];
-      if (!cached?.transcript?.parts?.length) throw new Error('请先整理当前视频。');
-      const answer = await modelText('只依据给定字幕回答。没有证据的信息明确说字幕中没有。先给直接答案，再给依据；尽量附时间戳。简体中文。', `问题：${q}\n\n字幕：\n${transcriptToText(cached.transcript)}`,
+      if (!cached?.summary) throw new Error('请先整理当前视频。');
+      const transcript = await ensureTranscriptForQuestion(cached);
+      const excerpt = transcriptForQuestion(transcript, q);
+      const summaryContext = JSON.stringify({ one_sentence: cached.summary.one_sentence, core_points: cached.summary.core_points, definitions: cached.summary.definitions });
+      const answer = await modelText('只依据给定字幕片段和已生成课程笔记回答。没有证据的信息明确说素材中没有。先给直接答案，再给依据；尽量附时间戳。简体中文。', `问题：${q}\n\n课程笔记摘要：${summaryContext}\n\n相关字幕片段：\n${excerpt}`,
         (t) => { if (box) box.innerHTML = statusBox(t); });
       box.innerHTML = `<div class="bilisum-answer">${esc(answer).replace(/\n/g, '<br>')}</div>`;
     } catch (e) { box.innerHTML = statusBox(e.message || String(e), 'error'); }
@@ -611,7 +697,14 @@
   function extractListVideos() {
     const map = new Map();
     let anchors = qsa('[class*="video-pod"] a[href], [class*="playlist"] a[href], [class*="multi-page"] a[href], [class*="episode"] a[href]');
-    if (anchors.length < 2) anchors = qsa('a[href*="bvid=BV"], a[href*="/video/BV"]');
+    if (anchors.length < 2 && state.isList) {
+      anchors = qsa(`a[href*="/list/${state.mid}"], a[href*="bvid=BV"]`).filter((a) => {
+        try {
+          const u = new URL(a.href, location.href);
+          return u.pathname.startsWith(`/list/${state.mid}`) && /^BV[0-9A-Za-z]+$/i.test(u.searchParams.get('bvid') || '');
+        } catch { return false; }
+      });
+    }
     anchors.forEach((a) => {
       const href = a.href || ''; let bvid = href.match(/\/video\/(BV[0-9A-Za-z]+)/i)?.[1];
       if (!bvid) { try { const q = new URL(href).searchParams.get('bvid'); if (/^BV/i.test(q || '')) bvid = q; } catch {} }
@@ -626,23 +719,27 @@
 
   async function renderSpaceHome() {
     const status = await backendStatusHtml(); const saveStatus = await saveStatusHtml();
-    const saved = await storeGet([channelKey(state.mid), batchKey(state.mid)]);
+    const saved = await storeGet([channelKey(state.mid), batchKey(state.mid), activeBatchKey(batchScope())]);
     state.channelVideos = saved[channelKey(state.mid)] || state.channelVideos || [];
     state.lastBatch = saved[batchKey(state.mid)] || state.lastBatch;
+    state.activeBatch = saved[activeBatchKey(batchScope())] || null;
     if (!state.selected.size && state.channelVideos.length) state.channelVideos.forEach((v) => state.selected.add(v.bvid));
     setMain(`${status}${saveStatus}
       <section class="bilisum-section"><div class="bilisum-title-row"><h2>批量课程笔记</h2><span class="bilisum-id">UID ${esc(state.mid)}</span></div>
         <div class="bilisum-actions"><button class="primary" id="bilisum-index">${state.channelVideos.length ? '更新投稿索引' : '获取全部投稿'}</button>
           <button id="bilisum-select-all">全选</button><button id="bilisum-select-none">清空选择</button>
           <button id="bilisum-run-batch" ${state.batchRunning ? 'disabled' : ''}>整理选中</button><button id="bilisum-stop-batch" ${state.batchRunning ? '' : 'disabled'}>暂停</button>
+          ${state.activeBatch?.items?.length ? '<button id="bilisum-resume-batch">继续未完成批次</button>' : ''}${state.lastBatch?.failures?.length ? '<button id="bilisum-retry-failed">重试失败</button>' : ''}
           ${state.lastBatch ? '<button id="bilisum-copy-batch">复制上个批次</button><button id="bilisum-save-batch">保存上个批次 TXT</button>' : ''}</div>
-        <p class="hint">同一次选中的视频算一个批次。完成后自动合并成一个 TXT：每课笔记按顺序排列，末尾再给本批次总览和复习顺序。</p></section>
-      <div id="bilisum-batch-progress"></div><div id="bilisum-video-list">${renderVideoList(state.channelVideos)}</div>`);
+        <p class="hint">同一次选中的视频算一个批次。默认按机器资源最多同时推进 2 条流水线；本地模型并发仍会自动保守限制。每完成一条都会保存断点。</p></section>
+      <div id="bilisum-batch-progress">${state.activeBatch?.items?.length ? statusBox(`发现未完成批次：${state.activeBatch.items.filter((x) => x.status === 'done').length}/${state.activeBatch.total || state.activeBatch.items.length} 已完成`, 'warn') : ''}</div><div id="bilisum-video-list">${renderVideoList(state.channelVideos)}</div>`);
     qs('#bilisum-index').onclick = indexChannel;
     qs('#bilisum-select-all').onclick = () => { state.channelVideos.forEach((v) => state.selected.add(v.bvid)); refreshVideoList(); };
     qs('#bilisum-select-none').onclick = () => { state.selected.clear(); refreshVideoList(); };
     qs('#bilisum-run-batch').onclick = () => runBatch(state.channelVideos.filter((v) => state.selected.has(v.bvid)), `UP_${state.mid}`);
-    qs('#bilisum-stop-batch').onclick = () => { state.stopRequested = true; const p = qs('#bilisum-batch-progress'); if (p) p.innerHTML = statusBox('将在当前视频处理结束后暂停。', 'warn'); };
+    qs('#bilisum-stop-batch').onclick = () => { state.stopRequested = true; const p = qs('#bilisum-batch-progress'); if (p) p.innerHTML = statusBox('将在当前正在处理的视频结束后暂停；断点会保留。', 'warn'); };
+    if (qs('#bilisum-resume-batch')) qs('#bilisum-resume-batch').onclick = () => resumeActiveBatch();
+    if (qs('#bilisum-retry-failed')) qs('#bilisum-retry-failed').onclick = () => retryFailedBatch();
     if (qs('#bilisum-copy-batch')) qs('#bilisum-copy-batch').onclick = copyLastBatch;
     if (qs('#bilisum-save-batch')) qs('#bilisum-save-batch').onclick = saveLastBatch;
     if (qs('#bilisum-choose-dir')) qs('#bilisum-choose-dir').onclick = () => chooseSaveDirectory().catch((e) => alert(e.message));
@@ -726,45 +823,184 @@
     return lines.join('\n').replace(/\n{4,}/g, '\n\n\n').trim() + '\n';
   }
 
-  async function runBatch(candidates, label = 'BiliSum_batch') {
+  async function resolveBatchConcurrency(settings) {
+    const raw = String(settings?.batchConcurrency || 'auto');
+    if (raw === '1' || raw === '2') return Number(raw);
+    const health = await send({ type: 'local:check' });
+    const memory = Number(health?.data?.system?.memory_gb || 0);
+    return memory >= 12 ? 2 : 1;
+  }
+
+  function batchCheckpointView(batch) {
+    return {
+      id: batch.id, label: batch.label, created_at: batch.created_at, total: batch.total,
+      scope: batch.scope, status: batch.status || 'running', concurrency: batch.concurrency || 1,
+      items: (batch.items || []).map((x) => ({ index: x.index, bvid: x.bvid, title: x.title || '', status: x.status || 'pending', error: x.error || '' })),
+      overview: batch.overview || null, overview_error: batch.overview_error || '', txt: batch.txt || ''
+    };
+  }
+
+  async function checkpointBatch(batch) {
+    state.activeBatch = batchCheckpointView(batch);
+    await storeSet({ [activeBatchKey(batch.scope)]: state.activeBatch });
+  }
+
+  async function clearActiveBatch(scope) {
+    state.activeBatch = null;
+    await chrome.storage.local.remove(activeBatchKey(scope));
+  }
+
+  async function hydrateBatchResults(batch) {
+    const successes = []; const failures = [];
+    for (const item of batch.items || []) {
+      if (item.status === 'done') {
+        const cached = (await storeGet(videoKey(item.bvid)))[videoKey(item.bvid)];
+        if (cached?.summary) successes.push({ index: item.index, bvid: item.bvid, title: cached.summary.title || item.title || item.bvid, cached });
+        else { item.status = 'pending'; item.error = ''; }
+      } else if (item.status === 'error') failures.push({ index: item.index, bvid: item.bvid, title: item.title || '', error: item.error || '未完成' });
+    }
+    successes.sort((a, b) => a.index - b.index); failures.sort((a, b) => a.index - b.index);
+    batch.successes = successes; batch.failures = failures;
+    return batch;
+  }
+
+  async function beginBatchLease() {
+    const r = await send({ type: 'local:batchBegin', leaseId: state.batchLeaseId || '' });
+    if (!r?.ok || !r.data?.lease_id) throw new Error(r?.error || '另一个 BiliSum 批次正在运行，请先完成或暂停它。');
+    state.batchLeaseId = r.data.lease_id;
+    clearInterval(state.batchHeartbeat);
+    state.batchHeartbeat = setInterval(() => {
+      if (state.batchLeaseId) send({ type: 'local:batchHeartbeat', leaseId: state.batchLeaseId });
+    }, 45000);
+  }
+
+  async function endBatchLease() {
+    clearInterval(state.batchHeartbeat); state.batchHeartbeat = null;
+    const lease = state.batchLeaseId; state.batchLeaseId = '';
+    if (lease) await send({ type: 'local:batchEnd', leaseId: lease }).catch(() => {});
+  }
+
+  function batchCounts(batch) {
+    const items = batch.items || [];
+    return {
+      done: items.filter((x) => x.status === 'done').length,
+      error: items.filter((x) => x.status === 'error').length,
+      processing: items.filter((x) => x.status === 'processing').length,
+      pending: items.filter((x) => x.status === 'pending').length
+    };
+  }
+
+  async function resumeActiveBatch() {
+    const active = state.activeBatch;
+    if (!active?.items?.length) return alert('没有可继续的批次。');
+    const items = active.items.map((x) => ({ ...x, status: x.status === 'processing' ? 'pending' : x.status }));
+    await runBatch(items.map((x) => ({ bvid: x.bvid, title: x.title })), active.label || 'BiliSum_batch', { ...active, items });
+  }
+
+  async function retryFailedBatch() {
+    const failures = state.lastBatch?.failures || [];
+    if (!failures.length) return alert('上个批次没有失败项目。');
+    await runBatch(failures.map((x) => ({ bvid: x.bvid, title: x.title || x.bvid })), `${state.lastBatch.label || 'BiliSum_batch'}_retry`);
+  }
+
+  async function runBatch(candidates, label = 'BiliSum_batch', resume = null) {
     if (state.batchRunning) return;
     candidates = [...new Map((candidates || []).filter((x) => x?.bvid).map((x) => [x.bvid, x])).values()];
     if (!candidates.length) { alert('没有选中可处理的视频。'); return; }
     state.batchRunning = true; state.stopRequested = false;
-    const created = Date.now(); const batch = { id: fileStamp(created), label, created_at: created, total: candidates.length, successes: [], failures: [], overview: null, overview_error: '', txt: '' };
     const settings = (await send({ type: 'settings:get' }))?.data || {};
+    const concurrency = await resolveBatchConcurrency(settings);
+    const created = Number(resume?.created_at || Date.now());
+    const scope = resume?.scope || batchScope();
+    const batch = resume ? {
+      ...resume, scope, status: 'running', concurrency, successes: [], failures: [], overview: null,
+      overview_error: '', txt: '',
+      items: (resume.items || []).map((x, i) => ({ index: Number.isFinite(x.index) ? x.index : i, bvid: x.bvid, title: x.title || x.bvid, status: x.status === 'processing' ? 'pending' : (x.status || 'pending'), error: x.error || '' }))
+    } : {
+      id: fileStamp(created), label, created_at: created, total: candidates.length, scope, status: 'running', concurrency,
+      items: candidates.map((v, i) => ({ index: i, bvid: v.bvid, title: v.title || v.bvid, status: 'pending', error: '' })),
+      successes: [], failures: [], overview: null, overview_error: '', txt: ''
+    };
+    batch.total = batch.items.length;
+    state.activeBatch = batch;
     const progress = () => qs('#bilisum-batch-progress');
+    let cursor = 0; let checkpointChain = Promise.resolve();
+    const queueCheckpoint = () => { checkpointChain = checkpointChain.then(() => checkpointBatch(batch)).catch(() => {}); return checkpointChain; };
+    const channelById = new Map(state.channelVideos.map((x) => [x.bvid, x]));
+    const updateProgress = (message = '') => {
+      const counts = batchCounts(batch); const p = progress();
+      if (p) p.innerHTML = statusBox(`批次 ${counts.done + counts.error}/${batch.total}｜并行 ${concurrency}｜${message || `${counts.processing} 处理中 · ${counts.pending} 待处理`}`);
+    };
+
+    let leaseStarted = false;
     try {
-      for (let i = 0; i < candidates.length; i++) {
-        if (state.stopRequested) break;
-        const v = candidates[i]; const channelItem = state.channelVideos.find((x) => x.bvid === v.bvid);
-        if (channelItem) { channelItem.status = 'processing'; channelItem.error = ''; refreshVideoList(); }
-        const show = (t) => { const p = progress(); if (p) p.innerHTML = statusBox(`批次 ${i + 1}/${candidates.length}｜${v.title || v.bvid}｜${t}`); };
-        try {
-          const cached = await processVideo(v, show);
-          batch.successes.push({ bvid: v.bvid, title: cached.summary?.title || v.title || v.bvid, cached });
-          if (channelItem) { channelItem.status = 'done'; channelItem.one_liner = cached.summary?.one_sentence || ''; channelItem.transcript_source = cached.summary?.transcript_source || ''; }
-        } catch (e) {
-          const err = e.message || String(e); batch.failures.push({ bvid: v.bvid, title: v.title || '', error: err });
-          if (channelItem) { channelItem.status = 'error'; channelItem.error = err; }
-          if (/B站接口 -412|B站接口 -352|风控/.test(err)) { state.stopRequested = true; }
+      await beginBatchLease(); leaseStarted = true;
+      await checkpointBatch(batch);
+      const worker = async (workerIndex) => {
+        if (workerIndex) await sleep(workerIndex * Math.max(300, Number(settings.scanDelayMs) || 1400));
+        while (!state.stopRequested) {
+          let item = null;
+          while (cursor < batch.items.length) {
+            const candidate = batch.items[cursor++];
+            if (candidate.status === 'done') continue;
+            item = candidate; break;
+          }
+          if (!item) break;
+          item.status = 'processing'; item.error = '';
+          const channelItem = channelById.get(item.bvid);
+          if (channelItem) { channelItem.status = 'processing'; channelItem.error = ''; refreshVideoList(); }
+          updateProgress(`${item.title || item.bvid}｜准备处理`); queueCheckpoint();
+          let finalError = null; let cached = null;
+          for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+              cached = await processVideo(item, (text) => updateProgress(`${item.title || item.bvid}｜${attempt ? '重试 · ' : ''}${text}`));
+              finalError = null; break;
+            } catch (e) {
+              finalError = e;
+              const err = e.message || String(e);
+              if (/B站接口 -412|B站接口 -352|风控/.test(err) || attempt > 0) break;
+              updateProgress(`${item.title || item.bvid}｜失败，自动重试 1 次`);
+              await sleep(900);
+            }
+          }
+          if (cached?.summary) {
+            item.status = 'done'; item.error = '';
+            if (channelItem) { channelItem.status = 'done'; channelItem.one_liner = cached.summary.one_sentence || ''; channelItem.transcript_source = cached.summary.transcript_source || ''; }
+          } else {
+            const err = finalError?.message || String(finalError || '未知错误');
+            item.status = 'error'; item.error = err;
+            if (channelItem) { channelItem.status = 'error'; channelItem.error = err; }
+            if (/B站接口 -412|B站接口 -352|风控/.test(err)) state.stopRequested = true;
+          }
+          if (state.mid && state.channelVideos.length) await storeSet({ [channelKey(state.mid)]: state.channelVideos });
+          refreshVideoList(); queueCheckpoint();
+          if (!state.stopRequested) await sleep(Math.max(500, Number(settings.scanDelayMs) || 1400));
         }
-        if (state.mid && state.channelVideos.length) await storeSet({ [channelKey(state.mid)]: state.channelVideos });
-        refreshVideoList();
-        await sleep(Math.max(500, Number(settings.scanDelayMs) || 1400));
-      }
-      if (batch.successes.length >= 2) {
+      };
+      await Promise.all(Array.from({ length: concurrency }, (_, i) => worker(i)));
+      await checkpointChain;
+      await hydrateBatchResults(batch);
+
+      if (!state.stopRequested && batch.successes.length >= 2) {
         const p = progress(); if (p) p.innerHTML = statusBox('单课整理完成，正在生成本批次总览…');
         try { batch.overview = await generateBatchOverview(batch.successes.map((x) => ({ bvid: x.bvid, title: x.title })), (t) => { const n = progress(); if (n) n.innerHTML = statusBox(t); }); }
         catch (e) { batch.overview_error = e.message || String(e); }
       }
-      batch.txt = buildBatchTxt(batch); state.lastBatch = batch;
-      await storeSet({ [batchKey(state.mid)]: batch });
-      if (settings.autoSaveBatch) {
-        try { await saveLastBatch(true); } catch {}
-      }
-      const p = progress(); if (p) p.innerHTML = statusBox(state.stopRequested ? `已暂停。当前批次已整理 ${batch.successes.length}/${batch.total} 条，并已形成可复制/保存的部分 TXT。` : `批次完成：${batch.successes.length}/${batch.total} 条成功。已合并为一个 TXT。`, state.stopRequested ? 'warn' : 'success');
+      batch.status = state.stopRequested ? 'paused' : 'done';
+      batch.txt = buildBatchTxt(batch);
+      const storedBatch = {
+        ...batch,
+        successes: batch.successes.map((x) => ({ index: x.index, bvid: x.bvid, title: x.title })),
+        failures: batch.failures.map((x) => ({ index: x.index, bvid: x.bvid, title: x.title, error: x.error }))
+      };
+      state.lastBatch = storedBatch;
+      await storeSet({ [batchKey(state.mid)]: storedBatch });
+      if (state.stopRequested) await checkpointBatch(batch); else await clearActiveBatch(scope);
+      if (settings.autoSaveBatch) { try { await saveLastBatch(true); } catch {} }
+      const p = progress();
+      if (p) p.innerHTML = statusBox(state.stopRequested ? `已暂停：${batch.successes.length}/${batch.total} 条完成。进度已保存，可稍后继续。` : `批次完成：${batch.successes.length}/${batch.total} 条成功，${batch.failures.length} 条失败。已合并为一个 TXT。`, state.stopRequested ? 'warn' : 'success');
     } finally {
+      if (leaseStarted) await endBatchLease();
       state.batchRunning = false; state.stopRequested = false;
       if (state.open) await renderHome();
     }

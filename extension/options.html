@@ -55,11 +55,20 @@
 
   <div class="card">
     <h2>批量</h2>
-    <label>视频间隔（毫秒）</label>
-    <input id="delay" type="number" min="600" step="100" value="1400">
-    <p class="hint">若 B 站出现请求频率限制，可提高到 2000–4000。整理与听写分别排队，避免同时占满内存或显存。</p>
+    <div class="row">
+      <div><label>同时处理视频</label><select id="batch-concurrency"><option value="auto">自动（推荐）</option><option value="1">1 条</option><option value="2">2 条</option></select></div>
+      <div><label>视频间隔（毫秒）</label><input id="delay" type="number" min="600" step="100" value="1400"></div>
+    </div>
+    <p class="hint">自动模式按内存决定 1–2 条流水线。即使同时推进 2 条，本地模型的真正并发仍由运行环境保守限制；低内存、CPU-only 机器通常保持单模型生成。若 B 站出现请求频率限制，可把间隔提高到 2000–4000。</p>
     <div class="actions"><button id="bili-test">检查 B 站接口</button></div>
     <div id="bili-status" class="status">尚未检测</div>
+  </div>
+
+  <div class="card">
+    <h2>备份与迁移</h2>
+    <div class="actions"><button id="backup-export">导出本地备份</button><button id="backup-import">导入备份</button><input id="backup-file" type="file" accept="application/json,.json" hidden></div>
+    <div id="backup-status" class="status">可备份设置、单课笔记、批次断点与索引。备份文件只保存在你选择的位置。</div>
+    <p class="hint">导入采用合并方式，不会先清空现有数据。也兼容从旧版开发扩展手动导出的原始 <code>chrome.storage.local</code> JSON。</p>
   </div>
 
   <div class="card">

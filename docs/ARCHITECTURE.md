@@ -28,7 +28,7 @@ The host exposes a small RPC surface:
 - notes queue
 - transcription queue
 
-Separating the queues prevents a long Whisper task from blocking note generation.
+Separating the queues prevents a long Whisper task from blocking note generation. Batch mode can keep up to two video pipelines in flight, while note-generation concurrency is independently capped according to local resources.
 
 ### Runtime state
 
@@ -54,3 +54,8 @@ The note prompt is constrained to source material; it must not add outside facts
 The portable channel checks a GitHub Release in the repository configured by `release_channel.json`. It verifies the GitHub-provided SHA-256 asset digest before extraction. `.runtime/` and `.git/` are preserved.
 
 A future store channel should be distributed through Chrome Web Store and rely on browser-managed extension updates. The native host registrar supports adding a store extension ID alongside the deterministic development ID.
+
+
+## Batch checkpointing
+
+Active batches keep a compact per-video checkpoint in extension storage. Completed single-video notes remain in their normal cache; batch records do not duplicate full transcripts. A short-lived native-host batch lease prevents portable updates from staging or applying while a batch is active.

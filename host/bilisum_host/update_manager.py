@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 GITHUB_API = "https://api.github.com"
-USER_AGENT = "BiliSum-Updater/5.2"
+USER_AGENT = "BiliSum-Updater/5.2.1"
 
 
 def _version_tuple(value: str) -> tuple[int, ...]:

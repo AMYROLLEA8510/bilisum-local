@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "BiliSum",
-  "version": "5.2.0",
+  "version": "5.2.1",
   "description": "Bilibili course notes, transcription fallback, batch processing and local file export.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwfosiA+feOIJc/yvUK5nMTfMPFMoIYIPYWwi/xmPl+aBWFZgMLPGjn++ccqYoD4QdOJ37rciWkb85DK+gOhLoxM3tIkY9wuWCFcuzG1OEdu6Ro1evMxtWVYUiU6DmtOitX9nLZC2JJGv85dbQpEapbABKa4P9Jf3A3UPYfYLtgkDVj187/iUT3OghOfmns5Uu1OZk2Mx0Z1tKaD56+WhUE0qlrUZwh1nb17jhPNmIsnraTZMsBwcbefXEWElAYcoAeaTWQMIMj/p2OIIUj06edjyb33teOHk7EL4sLHIGwBZzerSeLJJLKEXtF70Y96ZC4EcEZj4dDPOUa4s7C/oSwIDAQAB",
   "permissions": [
@@ -26,8 +26,12 @@
         "https://www.bilibili.com/list/*",
         "https://space.bilibili.com/*"
       ],
-      "js": ["content.js"],
-      "css": ["styles.css"],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "styles.css"
+      ],
       "run_at": "document_idle"
     }
   ],
