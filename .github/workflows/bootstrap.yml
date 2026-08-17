@@ -3,7 +3,7 @@ name: Bootstrap source
 on:
   push:
     paths:
-      - bootstrap_payload.b64
+      - bootstrap_payload.ready
 
 permissions:
   contents: write
@@ -19,14 +19,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          base64 -d bootstrap_payload.b64 > /tmp/bilisum-source.tar.xz
+          cat bootstrap_payload.part* | base64 -d > /tmp/bilisum-source.tar.xz
           rm -rf /tmp/bilisum-source
           mkdir -p /tmp/bilisum-source
           tar -xJf /tmp/bilisum-source.tar.xz -C /tmp/bilisum-source
           test -f /tmp/bilisum-source/bilisum-local/VERSION
           test "$(tr -d '\r\n' < /tmp/bilisum-source/bilisum-local/VERSION)" = "5.2.0"
           cp -a /tmp/bilisum-source/bilisum-local/. .
-          rm -f bootstrap_payload.b64 .github/workflows/bootstrap.yml
+          rm -f bootstrap_payload.ready bootstrap_payload.part* .github/workflows/bootstrap.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
