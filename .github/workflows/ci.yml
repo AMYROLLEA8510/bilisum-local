@@ -1,0 +1,34 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Security and release checks
+        run: python scripts/security_check.py
+      - name: Python tests
+        run: python -m unittest discover -s tests -v
+      - name: Python syntax
+        run: python -m compileall -q host scripts
+      - name: JavaScript syntax
+        run: |
+          node --check extension/background.js
+          node --check extension/content.js
+          node --check extension/options.js
+          node --check extension/setup.js
+      - name: Shell syntax
+        run: bash -n setup_unix.sh
+      - name: Build portable package
+        run: python scripts/build_release.py
