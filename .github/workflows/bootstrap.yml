@@ -25,6 +25,7 @@ jobs:
           tar -xJf /tmp/bilisum-source.tar.xz -C /tmp/bilisum-source
           test -f /tmp/bilisum-source/bilisum-local/VERSION
           test "$(tr -d '\r\n' < /tmp/bilisum-source/bilisum-local/VERSION)" = "5.2.0"
+          rm -rf /tmp/bilisum-source/bilisum-local/.github/workflows
           cp -a /tmp/bilisum-source/bilisum-local/. .
           rm -f bootstrap_payload.ready bootstrap_payload.part* .github/workflows/bootstrap.yml
           git config user.name "github-actions[bot]"
