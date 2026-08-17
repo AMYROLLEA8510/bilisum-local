@@ -1,0 +1,44 @@
+name: Release
+on:
+  push:
+    branches: [main]
+    paths:
+      - VERSION
+      - .github/workflows/release.yml
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Checks
+        run: |
+          python scripts/security_check.py
+          python -m unittest discover -s tests -v
+          node --check extension/background.js
+          node --check extension/content.js
+          node --check extension/options.js
+          node --check extension/setup.js
+          bash -n setup_unix.sh
+      - name: Build
+        run: python scripts/build_release.py
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          TAG="v$(cat VERSION)"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; replacing assets."
+            gh release upload "$TAG" dist/BiliSum-Portable-*.zip dist/SHA256SUMS.txt --clobber
+          else
+            gh release create "$TAG" dist/BiliSum-Portable-*.zip dist/SHA256SUMS.txt --target "$GITHUB_SHA" --title "BiliSum $TAG" --generate-notes
+          fi
