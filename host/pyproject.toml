@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bilisum-host"
-version = "5.2.0"
+version = "5.2.1"
 description = "Local native messaging host for BiliSum"
 requires-python = ">=3.10,<3.13"
 dependencies = []

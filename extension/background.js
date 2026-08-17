@@ -1,6 +1,8 @@
 const DEFAULT_SETTINGS = {
   model: 'auto',
   scanDelayMs: 1400,
+  batchConcurrency: 'auto',
+  modelParallelism: 'auto',
   maxTranscriptChunkChars: 26000,
   autoSummarize: true,
   autoOpenPanel: false,
@@ -417,13 +419,17 @@ async function checkBackend() {
 async function startBackendJob(kind, payload) {
   const settings = await getSettings();
   const params = kind === 'notes'
-    ? { ...payload, model: payload?.model || settings.model || 'auto' }
+    ? { ...payload, model: payload?.model || settings.model || 'auto', parallelism: payload?.parallelism || settings.modelParallelism || 'auto' }
     : { ...payload, model: payload?.model || settings.asrModel || 'auto', device: payload?.device || settings.asrDevice || 'auto', language: payload?.language ?? settings.asrLanguage ?? '' };
   const method = kind === 'notes' ? 'jobs.start.notes' : 'jobs.start.transcription';
   return await nativeRequest(method, params, 15000);
 }
 
 async function getBackendJob(jobId) { return await nativeRequest('jobs.get', { job_id: jobId }, 10000); }
+async function getBackendJobResultPage(jobId, offset = 0, limit = 400) { return await nativeRequest('jobs.result.page', { job_id: jobId, offset, limit }, 10000); }
+async function beginBatchLease(leaseId = '') { return await nativeRequest('batch.begin', { lease_id: leaseId, ttl_sec: 180 }, 10000); }
+async function heartbeatBatchLease(leaseId) { return await nativeRequest('batch.heartbeat', { lease_id: leaseId, ttl_sec: 180 }, 10000); }
+async function endBatchLease(leaseId) { return await nativeRequest('batch.end', { lease_id: leaseId }, 10000); }
 async function saveStatus() { return await nativeRequest('save.status', {}, 10000); }
 async function chooseSaveDirectory() { return await nativeRequest('save.choose', {}, 10000); }
 async function saveNote(payload) { return await nativeRequest('save.note', payload || {}, 30000); }
@@ -452,6 +458,8 @@ async function runScheduledUpdateCheck() {
     await chrome.storage.local.set({ updateInfo: info, updateCheckedAt: Date.now(), updateError: '' });
     await surfaceUpdateInfo(info);
     if (settings.updateMode === 'auto' && info?.available) {
+      const local = await checkBackend();
+      if (local?.batch_active || Number(local?.queues?.notes || 0) > 0 || Number(local?.queues?.transcription || 0) > 0 || Number(local?.parallelism?.notes_active || 0) > 0) return;
       const staged = await stageUpdate();
       if (staged?.staged && staged?.staging_path) {
         await applyUpdate(staged.staging_path);
@@ -494,6 +502,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg.type === 'local:notes:start') return sendResponse({ ok: true, data: await startBackendJob('notes', msg.payload || {}) });
       if (msg.type === 'local:asr:start') return sendResponse({ ok: true, data: await startBackendJob('asr', msg.payload || {}) });
       if (msg.type === 'local:job') return sendResponse({ ok: true, data: await getBackendJob(String(msg.jobId || '')) });
+      if (msg.type === 'local:jobResultPage') return sendResponse({ ok: true, data: await getBackendJobResultPage(String(msg.jobId || ''), Number(msg.offset || 0), Number(msg.limit || 400)) });
+      if (msg.type === 'local:batchBegin') return sendResponse({ ok: true, data: await beginBatchLease(String(msg.leaseId || '')) });
+      if (msg.type === 'local:batchHeartbeat') return sendResponse({ ok: true, data: await heartbeatBatchLease(String(msg.leaseId || '')) });
+      if (msg.type === 'local:batchEnd') return sendResponse({ ok: true, data: await endBatchLease(String(msg.leaseId || '')) });
       if (msg.type === 'save:status') return sendResponse({ ok: true, data: await saveStatus() });
       if (msg.type === 'save:choose') return sendResponse({ ok: true, data: await chooseSaveDirectory() });
       if (msg.type === 'save:set') return sendResponse({ ok: true, data: await setSaveDirectory(String(msg.directory || '')) });

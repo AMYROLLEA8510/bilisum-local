@@ -1,5 +1,5 @@
 const defaults = {
-  model: 'auto', scanDelayMs: 1400, autoSummarize: true, autoOpenPanel: false,
+  model: 'auto', scanDelayMs: 1400, batchConcurrency: 'auto', modelParallelism: 'auto', autoSummarize: true, autoOpenPanel: false,
   summaryMode: 'auto', autoSaveNotes: false, autoSaveBatch: false,
   asrEnabled: true, asrModel: 'auto', asrDevice: 'auto', asrLanguage: '', asrMaxMinutes: 240,
   updateMode: 'notify'
@@ -16,6 +16,7 @@ async function load() {
   const s = await chrome.storage.local.get(defaults);
   $('#model').value = s.model || 'auto';
   $('#delay').value = Number(s.scanDelayMs || 1400);
+  $('#batch-concurrency').value = String(s.batchConcurrency || 'auto');
   $('#auto').checked = !!s.autoSummarize;
   $('#auto-open').checked = !!s.autoOpenPanel;
   $('#auto-save-note').checked = !!s.autoSaveNotes;
@@ -36,6 +37,8 @@ async function save() {
   const settings = {
     model: $('#model').value.trim() || 'auto',
     scanDelayMs: Math.max(600, Number($('#delay').value) || 1400),
+    batchConcurrency: $('#batch-concurrency').value || 'auto',
+    modelParallelism: 'auto',
     autoSummarize: $('#auto').checked,
     autoOpenPanel: $('#auto-open').checked,
     autoSaveNotes: $('#auto-save-note').checked,
@@ -66,7 +69,8 @@ $('#local-test').onclick = async () => {
     if (d.version_ok === false) return setStatus(box, `本地组件版本为 ${d.version || '?'}，与当前扩展不一致。请重新运行本版本 SETUP。`, 'bad');
     const model = d.ollama?.has_model ? d.ollama.selected_model : '未找到兼容模型';
     const whisper = d.transcription_available === false ? '依赖缺失' : (d.transcription_model?.loaded ? `${d.transcription_model.model}/${d.transcription_model.device}` : '按需加载');
-    return setStatus(box, `本地组件 ${d.version || ''} 正常；整理模型：${model}；Whisper：${whisper}；队列：整理 ${d.queues?.notes ?? 0} / 听写 ${d.queues?.transcription ?? 0}。`, 'ok');
+    const parallel = d.parallelism?.notes_limit || d.parallelism?.recommended || 1;
+    return setStatus(box, `本地组件 ${d.version || ''} 正常；整理模型：${model}；Whisper：${whisper}；模型并发上限：${parallel}；队列：整理 ${d.queues?.notes ?? 0} / 听写 ${d.queues?.transcription ?? 0}。`, 'ok');
   }
   setStatus(box, `本地组件不可用：${r?.error || r?.data?.reason || '请重新运行对应系统的 SETUP。'}`, 'bad');
 };

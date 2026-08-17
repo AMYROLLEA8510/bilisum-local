@@ -27,7 +27,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-VERSION = "5.2.0"
+VERSION = "5.2.1"
 MAX_REQUEST_BYTES = 512 * 1024
 MAX_MEDIA_BYTES = 800 * 1024 * 1024
 USER_AGENT = (
@@ -48,7 +48,13 @@ JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 NOTE_QUEUE: queue.Queue[str] = queue.Queue()
 ASR_QUEUE: queue.Queue[str] = queue.Queue()
-WORKERS: dict[str, threading.Thread] = {}
+NOTE_WORKER_MAX = 2
+WORKERS: dict[str, list[threading.Thread]] = {"notes": [], "asr": []}
+NOTE_GATE = threading.Condition()
+NOTE_ACTIVE = 0
+NOTE_LIMIT = 1
+BATCH_LEASES: dict[str, float] = {}
+BATCH_LEASE_LOCK = threading.Lock()
 MODEL_LOCK = threading.Lock()
 MODEL = None
 MODEL_KEY: tuple[str, str, str] | None = None
@@ -341,7 +347,9 @@ def system_profile() -> dict[str, Any]:
         "cpu_count": os.cpu_count() or 0,
         "memory_gb": physical_memory_gb(),
         "nvidia_detected": have_nvidia(),
+        "gpu_memory_gb": gpu_memory_gb(),
         "recommended_whisper_model": recommended_whisper_model(),
+        "recommended_note_parallelism": recommended_note_parallelism(),
     }
 
 
@@ -354,6 +362,83 @@ def have_nvidia() -> bool:
         return result.returncode == 0
     except Exception:
         return False
+
+
+def gpu_memory_gb() -> float:
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return 0.0
+    try:
+        out = subprocess.check_output(
+            [exe, "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            text=True, timeout=4, stderr=subprocess.DEVNULL,
+        )
+        values = [float(x.strip()) / 1024 for x in out.splitlines() if x.strip()]
+        return round(max(values), 1) if values else 0.0
+    except Exception:
+        return 0.0
+
+
+def recommended_note_parallelism() -> int:
+    ram = physical_memory_gb()
+    vram = gpu_memory_gb()
+    system = platform.system().lower()
+    arch = platform.machine().lower()
+    if vram >= 16 and (not ram or ram >= 20):
+        return 2
+    if system == "darwin" and arch in {"arm64", "aarch64"} and ram >= 32:
+        return 2
+    return 1
+
+def resolve_note_parallelism(value: Any) -> int:
+    raw = str(value or "auto").strip().lower()
+    if raw == "2":
+        # Manual two-way generation is still capped on very small-memory systems.
+        ram = physical_memory_gb()
+        return 1 if ram and ram < 12 else 2
+    if raw == "1":
+        return 1
+    return recommended_note_parallelism()
+
+def set_note_parallelism(limit: int) -> int:
+    global NOTE_LIMIT
+    limit = max(1, min(NOTE_WORKER_MAX, int(limit or 1)))
+    with NOTE_GATE:
+        NOTE_LIMIT = limit
+        NOTE_GATE.notify_all()
+    return limit
+
+def _clean_batch_leases() -> None:
+    current = now()
+    with BATCH_LEASE_LOCK:
+        expired = [key for key, expiry in BATCH_LEASES.items() if expiry <= current]
+        for key in expired:
+            BATCH_LEASES.pop(key, None)
+
+def batch_lease_begin(lease_id: str = "", ttl_sec: float = 180.0) -> dict[str, Any]:
+    _clean_batch_leases()
+    lease_id = str(lease_id or uuid.uuid4().hex)
+    ttl = max(45.0, min(600.0, float(ttl_sec or 180.0)))
+    with BATCH_LEASE_LOCK:
+        BATCH_LEASES[lease_id] = now() + ttl
+        active = len(BATCH_LEASES)
+    return {"lease_id": lease_id, "ttl_sec": ttl, "active_leases": active}
+
+def batch_lease_heartbeat(lease_id: str, ttl_sec: float = 180.0) -> dict[str, Any]:
+    if not lease_id:
+        raise ValueError("Missing batch lease id")
+    return batch_lease_begin(lease_id, ttl_sec)
+
+def batch_lease_end(lease_id: str) -> dict[str, Any]:
+    with BATCH_LEASE_LOCK:
+        BATCH_LEASES.pop(str(lease_id or ""), None)
+    _clean_batch_leases()
+    return {"lease_id": lease_id, "active_leases": len(BATCH_LEASES)}
+
+def batch_lease_active() -> bool:
+    _clean_batch_leases()
+    with BATCH_LEASE_LOCK:
+        return bool(BATCH_LEASES)
 
 
 def _create_model(model_name: str, device: str, compute_type: str):
@@ -564,7 +649,7 @@ def process_asr_job(job_id: str) -> None:
 
 def _http_json(url: str, data: dict[str, Any] | None = None, timeout: float = 20.0) -> dict[str, Any]:
     body = None
-    headers = {"Accept": "application/json", "User-Agent": "BiliSum-Local/5.0"}
+    headers = {"Accept": "application/json", "User-Agent": "BiliSum-Local/5.2.1"}
     method = "GET"
     if data is not None:
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -577,6 +662,69 @@ def _http_json(url: str, data: dict[str, Any] | None = None, timeout: float = 20
     if not isinstance(parsed, dict):
         raise RuntimeError("Local model returned an invalid JSON envelope")
     return parsed
+
+
+def _choose_num_ctx(messages: list[dict[str, Any]], requested: Any = None) -> int:
+    if requested not in (None, "", 0, "0"):
+        try:
+            return max(4096, min(65536, int(requested)))
+        except Exception:
+            pass
+    chars = sum(len(str(item.get("content") or "")) for item in messages if isinstance(item, dict))
+    if chars <= 7000:
+        return 8192
+    if chars <= 15000:
+        return 16384
+    return 32768
+
+def _ollama_chat_stream(request: dict[str, Any], job_id: str, timeout: float) -> tuple[str, dict[str, Any]]:
+    body = json.dumps(request, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        f"{OLLAMA_BASE.rstrip('/')}/api/chat",
+        data=body,
+        headers={"Accept": "application/x-ndjson", "Content-Type": "application/json", "User-Agent": "BiliSum-Local/5.2.1"},
+        method="POST",
+    )
+    started = now()
+    first_token_at: float | None = None
+    pieces: list[str] = []
+    generated_chars = 0
+    final: dict[str, Any] = {}
+    last_report = 0.0
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        for raw in response:
+            if not raw.strip():
+                continue
+            event = json.loads(raw.decode("utf-8"))
+            if event.get("error"):
+                raise RuntimeError(f"Ollama: {event.get('error')}")
+            delta = str((event.get("message") or {}).get("content") or "")
+            if delta:
+                if first_token_at is None:
+                    first_token_at = now()
+                pieces.append(delta)
+                generated_chars += len(delta)
+            current = now()
+            if delta and (current - last_report >= 0.7 or generated_chars < 80):
+                elapsed = current - started
+                first = (first_token_at - started) if first_token_at is not None else 0.0
+                update_job(
+                    job_id, stage="generating", progress=30,
+                    detail=f"Generated {generated_chars} chars · {elapsed:.1f}s",
+                    generated_chars=generated_chars, elapsed_sec=round(elapsed, 1), first_token_sec=round(first, 2),
+                )
+                last_report = current
+            if event.get("done"):
+                final = event
+    content = "".join(pieces).strip()
+    if not content:
+        raise RuntimeError("Ollama returned an empty result")
+    final = dict(final or {})
+    final["content"] = content
+    final["elapsed_sec"] = round(now() - started, 2)
+    final["first_token_sec"] = round((first_token_at - started), 2) if first_token_at is not None else None
+    final["generated_chars"] = generated_chars
+    return content, final
 
 
 def _model_score(name: str, size: int = 0) -> int:
@@ -660,35 +808,48 @@ def process_note_job(job_id: str) -> None:
     messages = payload.get("messages") or []
     if not isinstance(messages, list) or not messages:
         raise RuntimeError("Note job has no messages")
+    num_ctx = _choose_num_ctx(messages, payload.get("num_ctx"))
     request = {
         "model": model,
         "messages": messages,
-        "stream": False,
+        "stream": True,
         "think": False,
-        "keep_alive": "10m",
+        "keep_alive": "30m" if batch_lease_active() else "10m",
         "options": {
             "temperature": float(payload.get("temperature") if payload.get("temperature") is not None else 0.08),
-            "num_ctx": int(payload.get("num_ctx") or 32768),
+            "num_ctx": num_ctx,
         },
     }
     if payload.get("format"):
         request["format"] = payload["format"]
-    update_job(job_id, stage="generating", progress=25, detail=f"Using {model}")
-    started = now()
-    data = _http_json(f"{OLLAMA_BASE.rstrip('/')}/api/chat", request, timeout=float(payload.get("timeout_sec") or 1800))
-    if data.get("error"):
-        raise RuntimeError(f"Ollama: {data.get('error')}")
-    content = str((data.get("message") or {}).get("content") or "").strip()
-    if not content:
-        raise RuntimeError("Ollama returned an empty result")
+    update_job(job_id, stage="generating", progress=25, detail=f"Using {model} · ctx {num_ctx}", generated_chars=0, elapsed_sec=0)
+    timeout = float(payload.get("timeout_sec") or 1800)
+    last_error: Exception | None = None
+    content = ""
+    data: dict[str, Any] = {}
+    for attempt in range(2):
+        try:
+            if attempt:
+                update_job(job_id, stage="generating", progress=25, detail="Model response interrupted; retrying once", retry_count=attempt)
+                time.sleep(1.0)
+            content, data = _ollama_chat_stream(request, job_id, timeout)
+            last_error = None
+            break
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
     result = {
         "content": content,
         "selected_model": model,
         "cached": False,
         "created_at": now(),
-        "elapsed_sec": round(now() - started, 2),
+        "elapsed_sec": float(data.get("elapsed_sec") or 0),
+        "first_token_sec": data.get("first_token_sec"),
+        "generated_chars": int(data.get("generated_chars") or len(content)),
         "prompt_tokens": int(data.get("prompt_eval_count") or 0),
         "output_tokens": int(data.get("eval_count") or 0),
+        "num_ctx": num_ctx,
     }
     NOTE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = cpath.with_suffix(".tmp")
@@ -710,10 +871,28 @@ def process_job(job_id: str, expected_kind: str) -> None:
         process_asr_job(job_id)
 
 
+def _acquire_note_slot(job_id: str) -> None:
+    global NOTE_ACTIVE
+    with NOTE_GATE:
+        while NOTE_ACTIVE >= NOTE_LIMIT:
+            update_job(job_id, status="queued", stage="queued", detail=f"Waiting for model slot · {NOTE_ACTIVE}/{NOTE_LIMIT}")
+            NOTE_GATE.wait(timeout=1.0)
+        NOTE_ACTIVE += 1
+
+def _release_note_slot() -> None:
+    global NOTE_ACTIVE
+    with NOTE_GATE:
+        NOTE_ACTIVE = max(0, NOTE_ACTIVE - 1)
+        NOTE_GATE.notify_all()
+
 def worker_loop(kind: str, job_queue: queue.Queue[str]) -> None:
     while True:
         job_id = job_queue.get()
+        note_slot = False
         try:
+            if kind == "notes":
+                _acquire_note_slot(job_id)
+                note_slot = True
             detail = "Starting note job" if kind == "notes" else "Starting transcription job"
             update_job(job_id, status="running", stage="starting", progress=1, detail=detail)
             process_job(job_id, kind)
@@ -728,15 +907,26 @@ def worker_loop(kind: str, job_queue: queue.Queue[str]) -> None:
                 traceback=traceback.format_exc(limit=8),
             )
         finally:
+            if note_slot:
+                _release_note_slot()
             job_queue.task_done()
             clean_old_jobs()
 
-
 def worker_alive(kind: str) -> bool:
-    thread = WORKERS.get(kind)
-    return bool(thread and thread.is_alive())
+    return any(thread.is_alive() for thread in WORKERS.get(kind, []))
 
+def worker_count(kind: str) -> int:
+    return sum(1 for thread in WORKERS.get(kind, []) if thread.is_alive())
 
+def _ensure_workers(kind: str, count: int, job_queue: queue.Queue[str]) -> None:
+    current = worker_count(kind)
+    for index in range(current, max(current, count)):
+        thread = threading.Thread(
+            target=worker_loop, args=(kind, job_queue),
+            name=f"bilisum-{kind}-worker-{index + 1}", daemon=True,
+        )
+        WORKERS.setdefault(kind, []).append(thread)
+        thread.start()
 
 def configure_runtime(*, root: str | Path | None = None, ollama_base: str | None = None) -> None:
     """Configure persistent runtime paths and start worker lanes once."""
@@ -752,12 +942,9 @@ def configure_runtime(*, root: str | Path | None = None, ollama_base: str | None
         OLLAMA_BASE = str(ollama_base).rstrip("/")
     for directory in (DATA_DIR, CACHE_DIR, NOTE_CACHE_DIR, MODEL_DIR, TEMP_DIR):
         directory.mkdir(parents=True, exist_ok=True)
-    if not worker_alive("notes"):
-        WORKERS["notes"] = threading.Thread(target=worker_loop, args=("notes", NOTE_QUEUE), name="bilisum-note-worker", daemon=True)
-        WORKERS["notes"].start()
-    if not worker_alive("asr"):
-        WORKERS["asr"] = threading.Thread(target=worker_loop, args=("asr", ASR_QUEUE), name="bilisum-transcribe-worker", daemon=True)
-        WORKERS["asr"].start()
+    set_note_parallelism(recommended_note_parallelism())
+    _ensure_workers("notes", NOTE_WORKER_MAX, NOTE_QUEUE)
+    _ensure_workers("asr", 1, ASR_QUEUE)
 
 
 def health() -> dict[str, Any]:
@@ -766,7 +953,9 @@ def health() -> dict[str, Any]:
         "service": "bilisum-native-host",
         "version": VERSION,
         "queues": {"notes": NOTE_QUEUE.qsize(), "transcription": ASR_QUEUE.qsize()},
-        "workers": {"notes": worker_alive("notes"), "transcription": worker_alive("asr")},
+        "workers": {"notes": worker_alive("notes"), "transcription": worker_alive("asr"), "note_threads": worker_count("notes")},
+        "parallelism": {"notes_limit": NOTE_LIMIT, "notes_active": NOTE_ACTIVE, "recommended": recommended_note_parallelism()},
+        "batch_active": batch_lease_active(),
         "transcription_available": importlib.util.find_spec("faster_whisper") is not None,
         "transcription_model": dict(MODEL_META),
         "data_dir": str(DATA_DIR),
@@ -784,6 +973,10 @@ def start_job(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
         "detail": "Queued", "created_at": now(), "updated_at": now(), "payload": dict(payload or {}),
     }
     target = NOTE_QUEUE if kind == "notes" else ASR_QUEUE
+    if kind == "notes":
+        resolved = set_note_parallelism(resolve_note_parallelism(payload.get("parallelism", "auto")))
+        payload = dict(payload or {})
+        payload["resolved_parallelism"] = resolved
     with JOBS_LOCK:
         JOBS[job_id] = job
     target.put(job_id)
@@ -801,11 +994,36 @@ def public_job(job_id: str) -> dict[str, Any]:
     q = NOTE_QUEUE if kind == "notes" else ASR_QUEUE
     public["queue_size"] = q.qsize()
     public["worker_alive"] = worker_alive(kind)
+    if kind == "asr" and job.get("status") == "done" and isinstance(job.get("result"), dict):
+        result = job.get("result") or {}
+        segments = result.get("segments") or []
+        if segments and len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > 700_000:
+            meta = {k: v for k, v in result.items() if k != "segments"}
+            meta.update({"segments": [], "paged": True, "segment_count": len(segments)})
+            public["result"] = meta
     public["queued_sec"] = round(max(0.0, now() - float(job.get("created_at") or now())), 1) if job.get("status") == "queued" else 0
     if job.get("status") == "queued" and not public["worker_alive"] and public["queued_sec"] > 5:
         public.update(status="error", stage="error", error="Local worker is not running", detail="Local worker is not running")
     return public
 
+
+
+def job_result_page(job_id: str, offset: int = 0, limit: int = 400) -> dict[str, Any]:
+    job = get_job(job_id)
+    if not job or job.get("status") != "done" or not isinstance(job.get("result"), dict):
+        raise KeyError("Completed job result not found")
+    segments = job["result"].get("segments") or []
+    offset = max(0, int(offset or 0))
+    limit = max(1, min(800, int(limit or 400)))
+    chunk = segments[offset: offset + limit]
+    next_offset = offset + len(chunk)
+    return {
+        "segments": chunk,
+        "offset": offset,
+        "next_offset": next_offset,
+        "done": next_offset >= len(segments),
+        "segment_count": len(segments),
+    }
 
 
 def active_jobs() -> list[dict[str, Any]]:

@@ -61,6 +61,18 @@ def dispatch(method: str, params: dict[str, Any]) -> Any:
         return core.start_job("asr", params)
     if method == "jobs.get":
         return core.public_job(str(params.get("job_id") or ""))
+    if method == "jobs.result.page":
+        return core.job_result_page(
+            str(params.get("job_id") or ""),
+            int(params.get("offset") or 0),
+            int(params.get("limit") or 400),
+        )
+    if method == "batch.begin":
+        return core.batch_lease_begin(str(params.get("lease_id") or ""), float(params.get("ttl_sec") or 180))
+    if method == "batch.heartbeat":
+        return core.batch_lease_heartbeat(str(params.get("lease_id") or ""), float(params.get("ttl_sec") or 180))
+    if method == "batch.end":
+        return core.batch_lease_end(str(params.get("lease_id") or ""))
     if method == "save.status":
         return core.save_status()
     if method == "save.choose":
@@ -74,10 +86,12 @@ def dispatch(method: str, params: dict[str, Any]) -> Any:
     if method == "updates.check":
         return check_update(ROOT, __version__)
     if method == "updates.stage":
+        if core.active_jobs() or core.batch_lease_active():
+            raise RuntimeError("Finish or pause the current BiliSum batch before preparing an update")
         return stage_update(ROOT, __version__)
     if method == "updates.apply":
         active = core.active_jobs()
-        if active:
+        if active or core.batch_lease_active():
             raise RuntimeError("Finish or pause current BiliSum tasks before installing an update")
         return launch_apply(ROOT, str(params.get("staging_path") or ""))
     raise ValueError(f"Unknown method: {method}")
