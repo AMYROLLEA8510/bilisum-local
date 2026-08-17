@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bilisum-host"
+version = "5.2.0"
+description = "Local native messaging host for BiliSum"
+requires-python = ">=3.10,<3.13"
+dependencies = []
+
+[project.scripts]
+bilisum-native-host = "bilisum_host.native:main"
+bilisum-apply-update = "bilisum_host.updater:main"
+
+[tool.setuptools]
+packages = ["bilisum_host"]

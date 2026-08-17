@@ -1,0 +1,7 @@
+{
+  "repository": "AMYROLLEA8510/bilisum-local",
+  "channel": "stable",
+  "updates_enabled": true,
+  "asset_prefix": "BiliSum-Portable-",
+  "store_extension_id": ""
+}

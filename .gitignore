@@ -1,0 +1,11 @@
+.runtime/
+dist/
+*.zip
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+Thumbs.db
+.env
+.env.*
+!.env.example
