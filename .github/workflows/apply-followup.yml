@@ -1,0 +1,27 @@
+name: Apply stability follow-up
+on:
+  push:
+    branches: [agent/v5.2.1-stability]
+    paths: [followup.ready]
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply tested follow-up
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat followup.part* | base64 -d | xz -d > /tmp/bilisum-followup.patch
+          git apply --check /tmp/bilisum-followup.patch
+          git apply /tmp/bilisum-followup.patch
+          rm -f followup.ready followup.part* .github/workflows/apply-followup.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Complete 5.2.1 migration safeguards"
+          git push origin HEAD:agent/v5.2.1-stability
