@@ -19,10 +19,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          base64 -d bootstrap_payload.b64 > /tmp/bilisum-source.zip
+          base64 -d bootstrap_payload.b64 > /tmp/bilisum-source.tar.xz
           rm -rf /tmp/bilisum-source
           mkdir -p /tmp/bilisum-source
-          unzip -q /tmp/bilisum-source.zip -d /tmp/bilisum-source
+          tar -xJf /tmp/bilisum-source.tar.xz -C /tmp/bilisum-source
           test -f /tmp/bilisum-source/bilisum-local/VERSION
           test "$(tr -d '\r\n' < /tmp/bilisum-source/bilisum-local/VERSION)" = "5.2.0"
           cp -a /tmp/bilisum-source/bilisum-local/. .
