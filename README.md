@@ -61,6 +61,16 @@ BiliSum 是一个面向 Bilibili 课程与长视频的本地笔记工具。它�
 
 随后在 Chromium 系浏览器中加载 `extension/`。
 
+## 备份与旧版迁移
+
+设置页可以导出/导入本地备份，覆盖设置、单课笔记、批次断点和索引。导入采用合并方式。由于早期 5.0.x 开发版没有固定扩展 ID，首次迁移到 5.2.x 前应先保存正在运行的批次 TXT；若还需要保留旧版缓存，可在旧版扩展的设置页 DevTools Console 中执行：
+
+```js
+chrome.storage.local.get(null).then(d => { const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([JSON.stringify(d)],{type:'application/json'})); a.download='BiliSum-legacy-backup.json'; a.click(); });
+```
+
+随后在新版本“备份与迁移”中导入该 JSON。正常的 5.2.x 以后内置更新不需要这样迁移。
+
 ## 更新
 
 设置页提供三种便携版更新策略：

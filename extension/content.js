@@ -866,7 +866,7 @@
 
   async function beginBatchLease() {
     const r = await send({ type: 'local:batchBegin', leaseId: state.batchLeaseId || '' });
-    if (!r?.ok || !r.data?.lease_id) return;
+    if (!r?.ok || !r.data?.lease_id) throw new Error(r?.error || '另一个 BiliSum 批次正在运行，请先完成或暂停它。');
     state.batchLeaseId = r.data.lease_id;
     clearInterval(state.batchHeartbeat);
     state.batchHeartbeat = setInterval(() => {
@@ -932,9 +932,10 @@
       if (p) p.innerHTML = statusBox(`批次 ${counts.done + counts.error}/${batch.total}｜并行 ${concurrency}｜${message || `${counts.processing} 处理中 · ${counts.pending} 待处理`}`);
     };
 
-    await beginBatchLease();
-    await checkpointBatch(batch);
+    let leaseStarted = false;
     try {
+      await beginBatchLease(); leaseStarted = true;
+      await checkpointBatch(batch);
       const worker = async (workerIndex) => {
         if (workerIndex) await sleep(workerIndex * Math.max(300, Number(settings.scanDelayMs) || 1400));
         while (!state.stopRequested) {
@@ -999,7 +1000,7 @@
       const p = progress();
       if (p) p.innerHTML = statusBox(state.stopRequested ? `已暂停：${batch.successes.length}/${batch.total} 条完成。进度已保存，可稍后继续。` : `批次完成：${batch.successes.length}/${batch.total} 条成功，${batch.failures.length} 条失败。已合并为一个 TXT。`, state.stopRequested ? 'warn' : 'success');
     } finally {
-      await endBatchLease();
+      if (leaseStarted) await endBatchLease();
       state.batchRunning = false; state.stopRequested = false;
       if (state.open) await renderHome();
     }

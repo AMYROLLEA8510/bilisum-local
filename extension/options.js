@@ -129,6 +129,42 @@ $('#update-check').onclick = async () => {
   renderUpdate(r.data, '', checkedAt);
 };
 
+function downloadJson(filename, value) {
+  const blob = new Blob([JSON.stringify(value, null, 2)], { type: 'application/json;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = filename; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+$('#backup-export').onclick = async () => {
+  const box = $('#backup-status'); setStatus(box, '正在生成备份…');
+  try {
+    const storage = await chrome.storage.local.get(null);
+    const payload = { format: 'bilisum-storage-backup', version: chrome.runtime.getManifest().version, exported_at: new Date().toISOString(), storage };
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    downloadJson(`BiliSum-backup-${stamp}.json`, payload);
+    setStatus(box, `备份已生成，共 ${Object.keys(storage).length} 个存储项。请妥善保管该文件。`, 'ok');
+  } catch (error) { setStatus(box, `备份失败：${error.message || error}`, 'bad'); }
+};
+
+$('#backup-import').onclick = () => $('#backup-file').click();
+$('#backup-file').onchange = async (event) => {
+  const box = $('#backup-status'); const file = event.target.files?.[0]; event.target.value = '';
+  if (!file) return;
+  if (file.size > 512 * 1024 * 1024) return setStatus(box, '备份文件过大，已拒绝导入。', 'bad');
+  setStatus(box, '正在校验并导入备份…');
+  try {
+    const parsed = JSON.parse(await file.text());
+    const storage = parsed?.format === 'bilisum-storage-backup' ? parsed.storage : parsed;
+    if (!storage || typeof storage !== 'object' || Array.isArray(storage)) throw new Error('不是有效的 BiliSum 存储备份');
+    const entries = Object.entries(storage).filter(([key]) => typeof key === 'string' && key.length <= 256);
+    if (!entries.length) throw new Error('备份中没有可导入的数据');
+    await chrome.storage.local.set(Object.fromEntries(entries));
+    setStatus(box, `已合并导入 ${entries.length} 个存储项。`, 'ok');
+    await load();
+  } catch (error) { setStatus(box, `导入失败：${error.message || error}`, 'bad'); }
+};
+
 $('#update-install').onclick = async () => {
   const box = $('#update-status'); setStatus(box, '正在获取并校验更新…'); await save();
   const r = await send({ type: 'update:install' });

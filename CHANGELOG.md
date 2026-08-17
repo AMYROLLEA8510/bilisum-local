@@ -10,6 +10,8 @@
 - Removed duplicate full-transcript copies from stored batch records and added transcript-cache pruning while preserving summaries.
 - Limited long-video Q&A to relevant transcript excerpts instead of sending the entire transcript blindly.
 - Tightened list-page video discovery to reduce accidental inclusion of recommendation links.
+- Prevented two tabs from starting competing batches in the same native-host session.
+- Added local storage backup/import for future upgrades and legacy-development-version migration.
 
 ## 5.2.0
 

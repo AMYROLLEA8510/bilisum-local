@@ -420,6 +420,8 @@ def batch_lease_begin(lease_id: str = "", ttl_sec: float = 180.0) -> dict[str, A
     lease_id = str(lease_id or uuid.uuid4().hex)
     ttl = max(45.0, min(600.0, float(ttl_sec or 180.0)))
     with BATCH_LEASE_LOCK:
+        if lease_id not in BATCH_LEASES and BATCH_LEASES:
+            raise RuntimeError("Another BiliSum batch is already active in this browser session")
         BATCH_LEASES[lease_id] = now() + ttl
         active = len(BATCH_LEASES)
     return {"lease_id": lease_id, "ttl_sec": ttl, "active_leases": active}

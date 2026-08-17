@@ -39,6 +39,13 @@ class StabilityTests(unittest.TestCase):
         core.batch_lease_end(lease["lease_id"])
         self.assertFalse(core.batch_lease_active())
 
+    def test_second_batch_lease_is_rejected(self):
+        first = core.batch_lease_begin("first", ttl_sec=60)
+        self.assertEqual(first["active_leases"], 1)
+        core.batch_lease_heartbeat("first", ttl_sec=60)
+        with self.assertRaises(RuntimeError):
+            core.batch_lease_begin("second", ttl_sec=60)
+
     def test_large_asr_result_is_paged(self):
         job_id = "paged-test"
         segments = [{"from": i, "to": i + 1, "content": "中" * 120} for i in range(7000)]
