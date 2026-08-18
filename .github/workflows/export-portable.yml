@@ -4,6 +4,8 @@ on:
     branches: [artifact/v5.2.1-file]
     paths:
       - .github/workflows/export-portable.yml
+  pull_request:
+    branches: [main]
 permissions:
   contents: read
 jobs:
