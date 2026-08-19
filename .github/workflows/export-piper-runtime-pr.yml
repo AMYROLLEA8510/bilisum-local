@@ -1,0 +1,30 @@
+name: Export Piper Runtime PR
+on:
+  pull_request:
+    paths: [piper_runtime_trigger.txt]
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Piper runtime and British English voice
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p runtime
+          curl -L --fail --retry 4 -o /tmp/piper.tar.gz https://github.com/rhasspy/piper/releases/download/v1.2.0/piper_amd64.tar.gz
+          tar -xzf /tmp/piper.tar.gz -C runtime
+          curl -L --fail --retry 4 -o runtime/en_GB-cori-high.onnx 'https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/cori/high/en_GB-cori-high.onnx?download=true'
+          curl -L --fail --retry 4 -o runtime/en_GB-cori-high.onnx.json 'https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/cori/high/en_GB-cori-high.onnx.json?download=true'
+          sha256sum runtime/en_GB-cori-high.onnx runtime/en_GB-cori-high.onnx.json > runtime/SHA256SUMS.txt
+          runtime/piper/piper --help >/dev/null
+      - name: Upload runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: piper-en-GB-cori-high-runtime
+          path: runtime/
+          if-no-files-found: error
+          compression-level: 0
